@@ -1,3 +1,4 @@
+import heapq
 import json
 import argparse
 import os
@@ -25,6 +26,13 @@ SIZE_THRESHOLD = 10  # bytes, for the size_exceeds event
 # cf-reactor reports its watchers before their first check, which only records
 # the state of the file and can't fire. Changes before it would be missed.
 FIRST_CHECK_S = 2
+
+# Each file waits up to this fraction of the interval longer between its turns.
+# Without it, the turns of a file and the checks of cf-reactor, both every second,
+# stay in step: when a change lands right after a check, it keeps doing so, and
+# it can be stamped before the detection of the previous change (read from the
+# output of cf-reactor a bit later), which mixes up the two.
+JITTER = 0.1
 
 # ============ file changes ============
 
@@ -222,7 +230,7 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
     print("==================== Statistics ====================")
     print(f"Event type:          file_{args.event}")
     print(f"Watchers:            {len(files)}")
-    print(f"Per-file interval:   {args.interval}s")
+    print(f"Per-file interval:   {args.interval}s (+ up to {JITTER:.0%} jitter)")
     print(f"Storm duration:      {storm_s:.1f}s")
     print(f"Total duration:      {total_s:.1f}s")
     print(f"Events fired:        {n} ({n / storm_s:.1f}/s)")
@@ -321,7 +329,7 @@ def main():
     events = []
     needs_reset = set()
     available = list(files)
-    cooling = deque()  # (ready_time, path); FIFO because every file waits the same interval
+    cooling = []  # heap of (ready_time, path)
     end = time.monotonic() + args.timeout
     while time.monotonic() < end:
         if proc.poll() is not None:
@@ -330,7 +338,7 @@ def main():
 
         now = time.time()
         while cooling and cooling[0][0] <= now:
-            available.append(cooling.popleft()[1])
+            available.append(heapq.heappop(cooling)[1])
         if not available:
             # every file is waiting: sleep until the next one is ready instead of spinning
             time.sleep(max(0.0, min(cooling[0][0] - now, end - time.monotonic())))
@@ -347,7 +355,7 @@ def main():
             fire(path)
             if reset is not None:
                 needs_reset.add(path)
-        cooling.append((now + args.interval, path))
+        heapq.heappush(cooling, (now + args.interval * random.uniform(1, 1 + JITTER), path))
 
     try:
         mem = memory_kb(pid)
