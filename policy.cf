@@ -37,7 +37,7 @@ body when file_size_exceeds(file, size)
 bundle reactor record_event(file)
 {
   reports:
-   "$(file): $(main.event)";
+   "handled '$(file)'";
 }
 
 bundle reactor main

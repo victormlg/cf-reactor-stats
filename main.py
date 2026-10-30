@@ -17,6 +17,9 @@ RESULT_PATH = "result.json"
 
 WATCHER_RE = re.compile(r"verbose: cf-reactor event watcher has (\d+) watcher\(s\)")
 OBSERVED_RE = re.compile(r"verbose: Observed (.+?) of file '([^']+)'")
+# report of the then bundle of policy.cf, at the start of the line (not the verbose
+# log of the reports promise)
+HANDLED_RE = re.compile(r"R: handled '([^']+)'")
 
 SIZE_THRESHOLD = 10  # bytes, for the size_exceeds event
 
@@ -206,7 +209,27 @@ def match(files, events, detections, undone):
     return latencies, caught, coalesced, spurious
 
 
-def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
+def handling_delays(detections, handled):
+    """
+    cf-reactor checks the files in a thread that queues the events it detects,
+    and runs their then bundle in its main thread. The k-th handling of a file is
+    the one of its k-th detection.
+    """
+    handled_by_file = defaultdict(list)
+    for t, path in handled:
+        handled_by_file[path].append(t)
+    seen = Counter()
+    delays = []
+    for t, _, path in sorted(detections):
+        k = seen[path]
+        seen[path] += 1
+        if k < len(handled_by_file[path]):
+            delays.append(handled_by_file[path][k] - t)
+    return delays
+
+
+def print_stats(args, files, events, detections, handled, storm_end, storm_s, cpu_s, mem,
+                total_s):
     undone = EVENTS[args.event][1] is not None
     latencies, caught, coalesced, spurious = match(files, events, detections, undone)
     n = len(events)
@@ -221,6 +244,10 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
     def pct(x):
         return f"{100.0 * x / n:.1f}%" if n else "-"
  
+    delays = sorted(handling_delays(detections, handled))
+    backlog = (sum(1 for t, _, _ in detections if t <= storm_end)
+               - sum(1 for t, _ in handled if t <= storm_end))
+
     kinds = ", ".join(f"{k}: {v}" for k, v in Counter(k for _, k, _ in detections).items())
  
     print()
@@ -241,6 +268,12 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
           f"{fmt(percentile(lat, 99))}")
     print(f"Latency min/max:     {fmt(lat[0] if lat else None)} / {fmt(lat[-1] if lat else None)}")
     print(f"Latency trend:       1st half avg {fmt(first_half)} -> 2nd half avg {fmt(second_half)}")
+    print(f"Detections handled:  {len(handled)} of {len(detections)}")
+    print(f"  backlog:           {backlog} not handled yet at the end of the storm")
+    print(f"Handling delay avg:  {fmt(mean(delays))}")
+    print(f"Handling p50/95/99:  {fmt(percentile(delays, 50))} / {fmt(percentile(delays, 95))} / "
+          f"{fmt(percentile(delays, 99))}")
+    print(f"Handling delay max:  {fmt(delays[-1] if delays else None)}")
     if cpu_s is not None:
         print(f"Reactor CPU:         {cpu_s:.2f}s CPU time = {100.0 * cpu_s / storm_s:.1f}% "
               f"of one core (avg)")
@@ -250,8 +283,9 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
     print("====================================================")
  
     with open(RESULT_PATH, "w") as f:
-        json.dump({"event": args.event, "events": events, "detections": detections}, f)
-    print(f"raw events and detections in {RESULT_PATH}")
+        json.dump({"event": args.event, "events": events, "detections": detections,
+                   "handled": handled}, f)
+    print(f"raw events, detections and handlings in {RESULT_PATH}")
 
 # ============ main ============
 
@@ -294,12 +328,15 @@ def main():
 
     ready = threading.Event()
     detections = []  # (time seen, kind, path)
+    handled = []  # (time seen, path)
 
     def reader():
         assert proc.stdout is not None
         for line in proc.stdout:
             if m := OBSERVED_RE.search(line):
                 detections.append((time.time(), m.group(1), m.group(2)))
+            elif m := HANDLED_RE.match(line):
+                handled.append((time.time(), m.group(1)))
             elif WATCHER_RE.search(line):
                 ready.set()
 
@@ -360,11 +397,13 @@ def main():
     except FileNotFoundError:  # cf-reactor exited during the storm
         mem, cpu_s = None, None
     storm_s = time.monotonic() - storm_start
+    storm_end = time.time()
     proc.terminate()
     proc.wait()
     total_s = time.monotonic() - storm_start
 
-    print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s)
+    print_stats(args, files, events, detections, handled, storm_end, storm_s, cpu_s, mem,
+                total_s)
 
 
 if __name__ == "__main__":
