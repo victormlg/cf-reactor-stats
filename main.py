@@ -108,6 +108,9 @@ def parse_args():
     parser.add_argument("--patience", type=float, default=5,
                         help="after the storm, seconds without any detection or handling "
                         "before giving up on cf-reactor catching up (default: 5)")
+    parser.add_argument("--max-wait", type=float,
+                        help="after the storm, seconds to wait at most for cf-reactor to "
+                        "catch up (default: no limit)")
 
     return parser.parse_args()
 
@@ -156,12 +159,13 @@ def memory_kb(pid):
                 mem[key.rstrip(":")] = int(value)
     return mem
 
-def wait_caught_up(proc, events, detections, handled, patience):
+def wait_caught_up(proc, events, detections, handled, patience, max_wait):
     """
     Wait for cf-reactor to detect the last change of every file and to handle
     every detection, so that a slow cf-reactor isn't stopped with events still
     queued. The last changes can be missed (e.g. undone before a check), so give
-    up once cf-reactor printed no detection or handling for patience seconds.
+    up once cf-reactor printed no detection or handling for patience seconds, or
+    after max_wait seconds (if not None).
     Returns why the wait ended.
     """
     last_change = {path: t for t, path in events}
@@ -181,6 +185,8 @@ def wait_caught_up(proc, events, detections, handled, patience):
                           handled[-1][0] if handled else 0)
         if time.time() - last_output > patience:
             return f"gave up, no detection or handling for {patience:g}s"
+        if max_wait is not None and time.time() - start > max_wait:
+            return f"stopped after --max-wait {max_wait:g}s"
         time.sleep(0.1)
     return "cf-reactor exited"
 
@@ -260,8 +266,8 @@ def handling_delays(detections, handled):
     return delays
 
 
-def print_stats(args, files, events, detections, handled, storm_end, storm_s, wait_end,
-                cpu_s, mem, total_s):
+def print_stats(args, files, events, detections, handled, storm_start_t, storm_end, storm_s,
+                wait_end, cpu_s, mem, total_s):
     undone = EVENTS[args.event][1] is not None
     latencies, caught, coalesced, spurious = match(files, events, detections, undone)
     n = len(events)
@@ -280,6 +286,17 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, wa
     backlog = (sum(1 for t, _, _ in detections if t <= storm_end)
                - sum(1 for t, _ in handled if t <= storm_end))
 
+    # running time: until cf-reactor handled its last event. Longer than the
+    # storm by more than a check interval means it lags behind.
+    last_handled = max((t for t, _ in handled), default=None)
+    running_s = last_handled - storm_start_t if last_handled is not None else None
+    lag_s = max(0.0, last_handled - storm_end) if last_handled is not None else None
+    # from the first detection, before which there is nothing to handle. When
+    # cf-reactor lags behind, it is busy all along: this is how much it can handle.
+    first_detection = min((t for t, _, _ in detections), default=None)
+    busy_s = last_handled - first_detection if last_handled is not None else None
+    handled_per_s = len(handled) / busy_s if busy_s else None
+
     kinds = ", ".join(f"{k}: {v}" for k, v in Counter(k for _, k, _ in detections).items())
  
     print()
@@ -290,6 +307,8 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, wa
     print(f"Storm duration:      {storm_s:.1f}s")
     print(f"Wait after storm:    {total_s - storm_s:.1f}s ({wait_end})")
     print(f"Total duration:      {total_s:.1f}s")
+    print(f"Running time:        {fmt(running_s)} (last event handled {fmt(lag_s)} after "
+          f"the storm)")
     print(f"Events fired:        {n} ({n / storm_s:.1f}/s)")
     print(f"Detections:          {len(detections)} ({kinds or 'none'})")
     print(f"Events caught:       {caught} ({pct(caught)})")
@@ -307,6 +326,7 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, wa
     print(f"Handling p50/95/99:  {fmt(percentile(delays, 50))} / {fmt(percentile(delays, 95))} / "
           f"{fmt(percentile(delays, 99))}")
     print(f"Handling delay max:  {fmt(delays[-1] if delays else None)}")
+    print(f"Handling rate:       {fmt(handled_per_s, '/s')} (its capacity if it lags behind)")
     if cpu_s is not None:
         print(f"Reactor CPU:         {cpu_s:.2f}s CPU time = {100.0 * cpu_s / total_s:.1f}% "
               f"of one core (avg over the total duration)")
@@ -316,7 +336,35 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, wa
     print("====================================================")
  
     with open(RESULT_PATH, "w") as f:
-        json.dump({"event": args.event, "events": events, "detections": detections,
+        summary = {
+            "event": args.event,
+            "watchers": len(files),
+            "interval": args.interval,
+            "timeout": args.timeout,
+            "storm_s": storm_s,
+            "total_s": total_s,
+            "wait_end": wait_end,
+            "events_fired": n,
+            "fired_per_s": n / storm_s,
+            "detections": len(detections),
+            "caught": caught,
+            "coalesced": coalesced,
+            "missed": missed,
+            "spurious": spurious,
+            "latency_avg": mean(lat),
+            "latency_p95": percentile(lat, 95),
+            "handled": len(handled),
+            "backlog": backlog,
+            "handling_delay_avg": mean(delays),
+            "handling_delay_p95": percentile(delays, 95),
+            "running_s": running_s,
+            "lag_s": lag_s,
+            "handled_per_s": handled_per_s,
+            "cpu_s": cpu_s,
+            "rss_kb": mem.get("VmRSS") if mem else None,
+            "peak_rss_kb": mem.get("VmHWM") if mem else None,
+        }
+        json.dump({"summary": summary, "events": events, "detections": detections,
                    "handled": handled}, f)
     print(f"raw events, detections and handlings in {RESULT_PATH}")
 
@@ -390,6 +438,7 @@ def main():
         return
     cpu_start = cpu_seconds(pid)
     storm_start = time.monotonic()
+    storm_start_t = time.time()
 
     print("=============== Start the event storm ==============")
     print(f"cf-reactor pid {pid}, {len(os.listdir(f'/proc/{pid}/task'))} threads")
@@ -428,7 +477,7 @@ def main():
     storm_s = time.monotonic() - storm_start
     storm_end = time.time()
 
-    wait_end = wait_caught_up(proc, events, detections, handled, args.patience)
+    wait_end = wait_caught_up(proc, events, detections, handled, args.patience, args.max_wait)
     try:
         mem = memory_kb(pid)
         cpu_s = cpu_seconds(pid) - cpu_start
@@ -440,8 +489,8 @@ def main():
     proc.wait()
     reader_thread.join(timeout=5)  # read the end of the output
 
-    print_stats(args, files, events, detections, handled, storm_end, storm_s, wait_end,
-                cpu_s, mem, total_s)
+    print_stats(args, files, events, detections, handled, storm_start_t, storm_end, storm_s,
+                wait_end, cpu_s, mem, total_s)
 
 
 if __name__ == "__main__":
