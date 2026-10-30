@@ -1,0 +1,22 @@
+body when file_modified(file)
+{
+  file_modified => "$(file)";
+}
+
+bundle reactor record_event(file)
+{
+  reports:
+   "$(file) was modified";
+}
+
+bundle reactor main
+{
+  vars:
+    "files" data => readjson("$(this.promise_dirname)/input.json", 99999999);
+
+  events:
+    "$(files)"
+      when => file_modified("$(files)"),
+      then => record_event("$(files)");
+}
+
