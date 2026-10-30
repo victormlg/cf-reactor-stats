@@ -33,8 +33,12 @@ def touch(path):
 
 
 def write_content(path):
-    with open(path, "w") as f:
+    # written next to it and moved in place, so cf-reactor never hashes the
+    # emptied file before the write, which would be two content changes
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
         f.write(f"{time.time_ns()}\n")
+    os.replace(tmp, path)
 
 
 # Cycles of 3 values, not toggles between 2: two changes between two checks of
