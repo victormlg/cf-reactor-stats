@@ -16,9 +16,71 @@ RESULT_PATH = "result.json"
 RESULT_PATH = "result.json"
 
 WATCHER_RE = re.compile(r"verbose: cf-reactor event watcher has (\d+) watcher\(s\)")
-OBSERVED_RE = re.compile(r"verbose: Observed (\w+) of file '([^']+)'")
+OBSERVED_RE = re.compile(r"verbose: Observed (.+?) of file '([^']+)'")
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+SIZE_THRESHOLD = 10  # bytes, for the size_exceeds event
+
+# ============ file changes ============
+
+def touch(path):
+    Path(path).touch()
+
+
+def write_content(path):
+    with open(path, "w") as f:
+        f.write(f"{time.time_ns()}\n")
+
+
+# Cycles of 3 values, not toggles between 2: two changes between two checks of
+# cf-reactor would cancel out, and the second one would look like a missed event.
+MODES = (0o644, 0o640, 0o600)
+UIDS = (0, 1, 2)
+
+
+def next_in_cycle(cycle, current):
+    return cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
+
+
+def change_permissions(path):
+    os.chmod(path, next_in_cycle(MODES, os.lstat(path).st_mode & 0o777))
+
+
+def change_owner(path):
+    os.lchown(path, next_in_cycle(UIDS, os.lstat(path).st_uid), -1)
+
+
+def exceed_size(path):
+    with open(path, "w") as f:
+        f.write("x" * (SIZE_THRESHOLD + 1))
+
+
+def shrink_size(path):
+    os.truncate(path, 0)
+
+
+# event type -> (fire, reset). fire makes the change cf-reactor should detect.
+# Some changes can't be repeated (a file can't be deleted twice), so every other
+# turn of such a file runs reset instead, which undoes the change and is not an
+# event (e.g. a deleted file is recreated).
+EVENTS = {
+    "deleted": (os.unlink, touch),
+    "created": (touch, os.unlink),
+    "modified": (touch, None),
+    "content_modified": (write_content, None),
+    "permissions_changed": (change_permissions, None),
+    "owner_changed": (change_owner, None),
+    "size_exceeds": (exceed_size, shrink_size),
+}
+
+
+def setup_file(path, event):
+    """Reset the file left by a previous run to the start state of the event."""
+    Path(path).unlink(missing_ok=True)
+    if event != "created":
+        touch(path)
+        os.chmod(path, 0o644)
 
 
 def parse_args():
@@ -26,6 +88,7 @@ def parse_args():
     parser.add_argument("num_watchers", type=int)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--interval", type=int, default=1)
+    parser.add_argument("--event", choices=EVENTS, default="modified")
 
     return parser.parse_args()
 
@@ -142,6 +205,7 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
  
     print()
     print("==================== Statistics ====================")
+    print(f"Event type:          file_{args.event}")
     print(f"Watchers:            {len(files)}")
     print(f"Per-file interval:   {args.interval}s")
     print(f"Storm duration:      {storm_s:.1f}s")
@@ -166,7 +230,7 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
     print("====================================================")
  
     with open(RESULT_PATH, "w") as f:
-        json.dump({"events": events, "detections": detections}, f)
+        json.dump({"event": args.event, "events": events, "detections": detections}, f)
     print(f"raw events and detections in {RESULT_PATH}")
 
 # ============ main ============
@@ -174,14 +238,23 @@ def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
 def main():
 
     args = parse_args()
+    if args.event == "owner_changed" and os.geteuid() != 0:
+        print("file_owner_changed needs root to change the owner of the files")
+        return
+    fire, reset = EVENTS[args.event]
+
     os.makedirs(DIR, exist_ok=True)
     files = [os.path.join(DIR, f"file-{i}.json") for i in range(args.num_watchers)]
 
     with open(FILES_PATH, "w") as f:
-        json.dump(files, f)
+        json.dump({
+            "event": f"file_{args.event}",
+            "size_threshold": SIZE_THRESHOLD,
+            "files": files,
+        }, f)
 
     for file in files:
-        Path(file).touch()
+        setup_file(file, args.event)
 
     # run in the background
     proc = subprocess.Popen(
@@ -227,6 +300,7 @@ def main():
     print(f"cf-reactor pid {pid}, {len(os.listdir(f'/proc/{pid}/task'))} threads")
 
     events = []
+    needs_reset = set()
     available = list(files)
     cooling = deque()  # (ready_time, path); FIFO because every file waits the same interval
     end = time.monotonic() + args.timeout
@@ -246,8 +320,14 @@ def main():
         available[j], available[-1] = available[-1], available[j]
         path = available.pop()
         now = time.time()
-        events.append((now, path))
-        Path(path).touch()
+        if path in needs_reset:
+            needs_reset.remove(path)
+            reset(path)
+        else:
+            events.append((now, path))
+            fire(path)
+            if reset is not None:
+                needs_reset.add(path)
         cooling.append((now + args.interval, path))
 
     mem = memory_kb(pid)

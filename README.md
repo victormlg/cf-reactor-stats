@@ -2,6 +2,23 @@
 
 `sudo python3 main.py 100 --interval 1 --timeout 30`
 
+`--event` picks the file event to test (default `modified`):
+
+| `--event`             | change made to the files                   |
+|-----------------------|--------------------------------------------|
+| `modified`            | touch                                      |
+| `content_modified`    | write new content                          |
+| `created`             | create (*)                                 |
+| `deleted`             | delete (*)                                 |
+| `permissions_changed` | chmod, cycling 644 -> 640 -> 600           |
+| `owner_changed`       | chown, cycling uid 0 -> 1 -> 2 (needs root) |
+| `size_exceeds`        | grow above 10 bytes (*)                    |
+
+(*) can't be repeated, so every other turn of a file undoes it instead (e.g.
+recreates the deleted file), which is not counted as an event. These fire half
+as many events, and a change undone before cf-reactor checked the file is
+missed, so use an `--interval` longer than the poll interval of cf-reactor.
+
 ```
 =============== Start the event storm ==============
 cf-reactor pid 41980, 7 threads

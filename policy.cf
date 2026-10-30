@@ -1,22 +1,89 @@
+body when file_deleted(file)
+{
+  file_deleted => "$(file)";
+}
+
+body when file_created(file)
+{
+  file_created => "$(file)";
+}
+
 body when file_modified(file)
 {
   file_modified => "$(file)";
 }
 
+body when file_content_modified(file)
+{
+  file_content_modified => "$(file)";
+}
+
+body when file_permissions_changed(file)
+{
+  file_permissions_changed => "$(file)";
+}
+
+body when file_owner_changed(file)
+{
+  file_owner_changed => "$(file)";
+}
+
+body when file_size_exceeds(file, size)
+{
+  file_size_exceeds => "$(file)";
+  size_threshold => "$(size)";
+}
+
 bundle reactor record_event(file)
 {
   reports:
-   "$(file) was modified";
+   "$(file): $(main.event)";
 }
 
 bundle reactor main
 {
   vars:
-    "files" data => readjson("$(this.promise_dirname)/input.json", 99999999);
+    "input" data => readjson("$(this.promise_dirname)/input.json", 99999999);
+    "event" string => "$(input[event])";
+    "size_threshold" string => "$(input[size_threshold])";
+    "files" slist => getvalues("input[files]");
+
+  classes:
+    "$(event)" expression => "any";
 
   events:
-    "$(files)"
-      when => file_modified("$(files)"),
-      then => record_event("$(files)");
-}
+    file_deleted::
+      "$(files)"
+        when => file_deleted("$(files)"),
+        then => record_event("$(files)");
 
+    file_created::
+      "$(files)"
+        when => file_created("$(files)"),
+        then => record_event("$(files)");
+
+    file_modified::
+      "$(files)"
+        when => file_modified("$(files)"),
+        then => record_event("$(files)");
+
+    file_content_modified::
+      "$(files)"
+        when => file_content_modified("$(files)"),
+        then => record_event("$(files)");
+
+    file_permissions_changed::
+      "$(files)"
+        when => file_permissions_changed("$(files)"),
+        then => record_event("$(files)");
+
+    file_owner_changed::
+      "$(files)"
+        when => file_owner_changed("$(files)"),
+        then => record_event("$(files)");
+
+    file_size_exceeds::
+      "$(files)"
+        when => file_size_exceeds("$(files)", "$(size_threshold)"),
+        then => record_event("$(files)");
+}
