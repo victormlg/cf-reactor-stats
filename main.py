@@ -22,6 +22,10 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 
 SIZE_THRESHOLD = 10  # bytes, for the size_exceeds event
 
+# cf-reactor reports its watchers before their first check, which only records
+# the state of the file and can't fire. Changes before it would be missed.
+FIRST_CHECK_S = 2
+
 # ============ file changes ============
 
 def touch(path):
@@ -290,7 +294,7 @@ def main():
         print("cf-reactor never reported its watchers")
         proc.terminate()
         return
-
+    time.sleep(FIRST_CHECK_S)
 
     pid = reactor_pid(proc.pid)
     cpu_start = cpu_seconds(pid)
