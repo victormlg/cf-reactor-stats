@@ -160,11 +160,15 @@ def fmt(x, unit="s"):
     return "-" if x is None else f"{x:.3f}{unit}"
  
  
-def match(files, events, detections):
+def match(files, events, detections, undone):
     """
     One detection covers every change of that file since its previous detection
     (a poll only sees that something changed). Latency is measured from the first
     covered change; extra covered changes are 'coalesced', uncovered ones are missed.
+
+    If the changes are undone between two events (undone=True, e.g. a deleted file
+    is recreated), a detection only covers the last change: the previous ones were
+    undone before a poll could see them, so they are missed.
     """
     ev_by_file = defaultdict(list)
     det_by_file = defaultdict(list)
@@ -185,6 +189,8 @@ def match(files, events, detections):
             if not covered:
                 spurious += 1
                 continue
+            if undone:
+                covered = covered[-1:]
             latencies.append((covered[0], d - covered[0]))
             caught += len(covered)
             coalesced += len(covered) - 1
@@ -192,7 +198,8 @@ def match(files, events, detections):
 
 
 def print_stats(args, files, events, detections, storm_s, cpu_s, mem, total_s):
-    latencies, caught, coalesced, spurious = match(files, events, detections)
+    undone = EVENTS[args.event][1] is not None
+    latencies, caught, coalesced, spurious = match(files, events, detections, undone)
     n = len(events)
     missed = n - caught
     lat = sorted(l for _, l in latencies)
