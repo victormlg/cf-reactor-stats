@@ -14,12 +14,9 @@ DIR = "/tmp/test"
 POLICY = os.path.abspath("policy.cf")
 FILES_PATH = "input.json"
 RESULT_PATH = "result.json"
-RESULT_PATH = "result.json"
 
 WATCHER_RE = re.compile(r"verbose: cf-reactor event watcher has (\d+) watcher\(s\)")
 OBSERVED_RE = re.compile(r"verbose: Observed (.+?) of file '([^']+)'")
-
-CLK_TCK = os.sysconf("SC_CLK_TCK")
 
 SIZE_THRESHOLD = 10  # bytes, for the size_exceeds event
 
