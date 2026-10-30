@@ -25,6 +25,19 @@ isn't stopped with events still queued. It gives up once cf-reactor printed
 nothing for `--patience` seconds (default 5), e.g. when the last changes were
 missed.
 
+## How many events per second?
+
+`sudo python3 bench.py --timeout 30`
+
+For each event type (or those of `--events`), runs `main.py` with twice as
+many watchers each time, until cf-reactor lags behind: it is still handling
+events more than `--tolerance` seconds (default 2) after the end of the storm,
+i.e. the running time is longer than the given time. Then bisects between the
+last load it kept up with and the first lagging one. Prints the events per
+second it keeps up with, those it lags behind at, and how many it can handle
+at most (its handling rate while lagging). The logs and results of every run
+are in `bench-results/`.
+
 ```
 =============== Start the event storm ==============
 cf-reactor pid 41980, 7 threads
