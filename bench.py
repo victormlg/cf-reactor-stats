@@ -44,7 +44,7 @@ def parse_args():
 
 
 def run(args, event, watchers):
-    """Runs main.py, returns the summary of its result, or None if it failed."""
+    """Runs main.py and returns the summary of its result. Exits if it failed."""
     name = f"{event}-{watchers}"
     result_path = os.path.join(HERE, RESULT_PATH)
     if os.path.exists(result_path):
@@ -52,10 +52,11 @@ def run(args, event, watchers):
     cmd = [sys.executable, "main.py", str(watchers), "--event", event,
            "--interval", str(args.interval), "--timeout", str(args.timeout),
            "--max-wait", str(args.max_wait)]
-    with open(os.path.join(OUT_DIR, f"{name}.log"), "w") as log:
-        subprocess.run(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
-    if not os.path.exists(result_path):
-        return None
+    log_path = os.path.join(OUT_DIR, f"{name}.log")
+    with open(log_path, "w") as log:
+        proc = subprocess.run(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+    if proc.returncode != 0 or not os.path.exists(result_path):
+        sys.exit(f"main.py failed with {watchers} watchers for file_{event}, see {log_path}")
     os.replace(result_path, os.path.join(OUT_DIR, f"{name}.json"))
     with open(os.path.join(OUT_DIR, f"{name}.json")) as f:
         return json.load(f)["summary"]
@@ -92,8 +93,6 @@ def bench(args, event):
     n = args.start
     while n <= args.max_watchers:
         s = run(args, event, n)
-        if s is None:
-            return ok, bad, f"main.py failed with {n} watchers, see {OUT_DIR}/{event}-{n}.log"
         lags = lagging(args, s)
         report(event, s, lags)
         if lags:
@@ -114,9 +113,6 @@ def bench(args, event):
         if mid <= lo:
             break
         s = run(args, event, mid)
-        if s is None:
-            note = f"main.py failed with {mid} watchers, see {OUT_DIR}/{event}-{mid}.log"
-            break
         lags = lagging(args, s)
         report(event, s, lags)
         if lags:
