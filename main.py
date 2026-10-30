@@ -304,6 +304,10 @@ def main():
     time.sleep(FIRST_CHECK_S)
 
     pid = reactor_pid(proc.pid)
+    if pid is None:
+        print("cf-reactor process not found")
+        proc.terminate()
+        return
     cpu_start = cpu_seconds(pid)
     storm_start = time.monotonic()
 
@@ -341,8 +345,11 @@ def main():
                 needs_reset.add(path)
         cooling.append((now + args.interval, path))
 
-    mem = memory_kb(pid)
-    cpu_s = cpu_seconds(pid) - cpu_start
+    try:
+        mem = memory_kb(pid)
+        cpu_s = cpu_seconds(pid) - cpu_start
+    except FileNotFoundError:  # cf-reactor exited during the storm
+        mem, cpu_s = None, None
     storm_s = time.monotonic() - storm_start
     proc.terminate()
     proc.wait()
