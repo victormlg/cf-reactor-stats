@@ -19,6 +19,12 @@ recreates the deleted file), which is not counted as an event. These fire half
 as many events, and a change undone before cf-reactor checked the file is
 missed, so use an `--interval` longer than the poll interval of cf-reactor.
 
+After the storm, the script waits for cf-reactor to detect the last change of
+every file and to run the then bundle of every detection, so a slow cf-reactor
+isn't stopped with events still queued. It gives up once cf-reactor printed
+nothing for `--patience` seconds (default 5), e.g. when the last changes were
+missed.
+
 ```
 =============== Start the event storm ==============
 cf-reactor pid 41980, 7 threads

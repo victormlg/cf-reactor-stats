@@ -105,6 +105,9 @@ def parse_args():
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--interval", type=int, default=1)
     parser.add_argument("--event", choices=EVENTS, default="modified")
+    parser.add_argument("--patience", type=float, default=5,
+                        help="after the storm, seconds without any detection or handling "
+                        "before giving up on cf-reactor catching up (default: 5)")
 
     return parser.parse_args()
 
@@ -152,6 +155,35 @@ def memory_kb(pid):
                 key, value = line.split()[:2]
                 mem[key.rstrip(":")] = int(value)
     return mem
+
+def wait_caught_up(proc, events, detections, handled, patience):
+    """
+    Wait for cf-reactor to detect the last change of every file and to handle
+    every detection, so that a slow cf-reactor isn't stopped with events still
+    queued. The last changes can be missed (e.g. undone before a check), so give
+    up once cf-reactor printed no detection or handling for patience seconds.
+    Returns why the wait ended.
+    """
+    last_change = {path: t for t, path in events}
+    last_detection = {}
+    seen = 0
+    start = time.time()
+    while proc.poll() is None:
+        new = detections[seen:]
+        seen += len(new)
+        for t, _, path in new:
+            last_detection[path] = t
+        if (len(handled) >= seen and
+                all(last_detection.get(path, 0) >= t for path, t in last_change.items())):
+            return "caught up"
+
+        last_output = max(start, detections[-1][0] if detections else 0,
+                          handled[-1][0] if handled else 0)
+        if time.time() - last_output > patience:
+            return f"gave up, no detection or handling for {patience:g}s"
+        time.sleep(0.1)
+    return "cf-reactor exited"
+
 
 # ============ statistics ============
  
@@ -228,8 +260,8 @@ def handling_delays(detections, handled):
     return delays
 
 
-def print_stats(args, files, events, detections, handled, storm_end, storm_s, cpu_s, mem,
-                total_s):
+def print_stats(args, files, events, detections, handled, storm_end, storm_s, wait_end,
+                cpu_s, mem, total_s):
     undone = EVENTS[args.event][1] is not None
     latencies, caught, coalesced, spurious = match(files, events, detections, undone)
     n = len(events)
@@ -256,6 +288,7 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, cp
     print(f"Watchers:            {len(files)}")
     print(f"Per-file interval:   {args.interval}s (+ up to {JITTER:.0%} jitter)")
     print(f"Storm duration:      {storm_s:.1f}s")
+    print(f"Wait after storm:    {total_s - storm_s:.1f}s ({wait_end})")
     print(f"Total duration:      {total_s:.1f}s")
     print(f"Events fired:        {n} ({n / storm_s:.1f}/s)")
     print(f"Detections:          {len(detections)} ({kinds or 'none'})")
@@ -275,8 +308,8 @@ def print_stats(args, files, events, detections, handled, storm_end, storm_s, cp
           f"{fmt(percentile(delays, 99))}")
     print(f"Handling delay max:  {fmt(delays[-1] if delays else None)}")
     if cpu_s is not None:
-        print(f"Reactor CPU:         {cpu_s:.2f}s CPU time = {100.0 * cpu_s / storm_s:.1f}% "
-              f"of one core (avg)")
+        print(f"Reactor CPU:         {cpu_s:.2f}s CPU time = {100.0 * cpu_s / total_s:.1f}% "
+              f"of one core (avg over the total duration)")
     if mem:
         print(f"Reactor memory:      {mem.get('VmRSS', 0) / 1024:.1f} MB now, "
               f"{mem.get('VmHWM', 0) / 1024:.1f} MB peak")
@@ -340,7 +373,8 @@ def main():
             elif WATCHER_RE.search(line):
                 ready.set()
 
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
     # wait for the daemon to have read the policy
     if not ready.wait(timeout=30):
@@ -391,19 +425,23 @@ def main():
                 needs_reset.add(path)
         heapq.heappush(cooling, (now + args.interval * random.uniform(1, 1 + JITTER), path))
 
+    storm_s = time.monotonic() - storm_start
+    storm_end = time.time()
+
+    wait_end = wait_caught_up(proc, events, detections, handled, args.patience)
     try:
         mem = memory_kb(pid)
         cpu_s = cpu_seconds(pid) - cpu_start
-    except FileNotFoundError:  # cf-reactor exited during the storm
+    except FileNotFoundError:  # cf-reactor exited
         mem, cpu_s = None, None
-    storm_s = time.monotonic() - storm_start
-    storm_end = time.time()
-    proc.terminate()
-    proc.wait()
     total_s = time.monotonic() - storm_start
 
-    print_stats(args, files, events, detections, handled, storm_end, storm_s, cpu_s, mem,
-                total_s)
+    proc.terminate()
+    proc.wait()
+    reader_thread.join(timeout=5)  # read the end of the output
+
+    print_stats(args, files, events, detections, handled, storm_end, storm_s, wait_end,
+                cpu_s, mem, total_s)
 
 
 if __name__ == "__main__":
