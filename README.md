@@ -13,6 +13,15 @@
 | `permissions_changed` | chmod, cycling 644 -> 640 -> 600           |
 | `owner_changed`       | chown, cycling uid 0 -> 1 -> 2 (needs root) |
 | `size_exceeds`        | grow above 10 bytes (*)                    |
+| `user_added`          | useradd `cfrs-user-N` (*) (needs root)     |
+| `user_removed`        | userdel `cfrs-user-N` (*) (needs root)     |
+| `package_installed`   | dpkg --install `cfrs-pkg-N` (*) (needs root) |
+| `package_uninstalled` | dpkg --purge `cfrs-pkg-N` (*) (needs root) |
+
+The packages are empty dummy packages, built in `/tmp/test/debs`. cf-reactor lists
+them with the `apt_get` package module (`/var/cfengine/modules/packages/apt_get`),
+only every 10s, so use `--interval 15 --patience 15` (and `--tolerance 11` for
+bench.py). The test users and packages are removed at the end of a run.
 
 (*) can't be repeated, so every other turn of a file undoes it instead (e.g.
 recreates the deleted file), which is not counted as an event. These fire half

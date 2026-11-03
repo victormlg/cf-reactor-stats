@@ -34,6 +34,35 @@ body when file_size_exceeds(file, size)
   size_threshold => "$(size)";
 }
 
+body when user_added(user)
+{
+  user_added => "$(user)";
+}
+
+body when user_removed(user)
+{
+  user_removed => "$(user)";
+}
+
+body when package_installed(package)
+{
+  package_installed => "$(package)";
+  package_module => "apt_get";
+}
+
+body when package_uninstalled(package)
+{
+  package_uninstalled => "$(package)";
+  package_module => "apt_get";
+}
+
+# $(sys.workdir)/modules/packages/apt_get of the masterfiles, its shebang is
+# /usr/bin/python, which Ubuntu 24 doesn't have
+body package_module apt_get
+{
+  interpreter => "/usr/bin/python3";
+}
+
 bundle reactor record_event(file)
 {
   reports:
@@ -85,5 +114,25 @@ bundle reactor main
     file_size_exceeds::
       "$(files)"
         when => file_size_exceeds("$(files)", "$(size_threshold)"),
+        then => record_event("$(files)");
+
+    user_added::
+      "$(files)"
+        when => user_added("$(files)"),
+        then => record_event("$(files)");
+
+    user_removed::
+      "$(files)"
+        when => user_removed("$(files)"),
+        then => record_event("$(files)");
+
+    package_installed::
+      "$(files)"
+        when => package_installed("$(files)"),
+        then => record_event("$(files)");
+
+    package_uninstalled::
+      "$(files)"
+        when => package_uninstalled("$(files)"),
         then => record_event("$(files)");
 }

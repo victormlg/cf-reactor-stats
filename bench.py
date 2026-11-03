@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 
-from main import EVENTS, JITTER, RESULT_PATH
+from main import EVENTS, JITTER, RESULT_PATH, event_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "bench-results")
@@ -56,7 +56,7 @@ def run(args, event, watchers):
     with open(log_path, "w") as log:
         proc = subprocess.run(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
     if proc.returncode != 0 or not os.path.exists(result_path):
-        sys.exit(f"main.py failed with {watchers} watchers for file_{event}, see {log_path}")
+        sys.exit(f"main.py failed with {watchers} watchers for {event_name(event)}, see {log_path}")
     os.replace(result_path, os.path.join(OUT_DIR, f"{name}.json"))
     with open(os.path.join(OUT_DIR, f"{name}.json")) as f:
         return json.load(f)["summary"]
@@ -128,18 +128,20 @@ def main():
     if "owner_changed" in events and os.geteuid() != 0:
         print("Skipping owner_changed, it needs root")
         events = [e for e in events if e != "owner_changed"]
+    if os.geteuid() != 0:
+        events = [e for e in events if not e.startswith(("user_", "package_"))]
     os.makedirs(OUT_DIR, exist_ok=True)
 
     results = {}
     for event in events:
-        print(f"=== file_{event}")
+        print(f"=== {event_name(event)}")
         results[event] = bench(args, event)
 
     print()
     print("========================== Events per second ==========================")
     print(f"{'event':<26} {'keeps up with':>14} {'lags behind at':>15} {'handles at most':>16}")
     for event, (ok, bad, note) in results.items():
-        print(f"file_{event:<21} {fmt(ok and ok['fired_per_s']):>14} "
+        print(f"{event_name(event):<26} {fmt(ok and ok['fired_per_s']):>14} "
               f"{fmt(bad and bad['fired_per_s']):>15} {fmt(bad and bad['handled_per_s']):>16}"
               + (f"  ({note})" if note else ""))
     print("=======================================================================")

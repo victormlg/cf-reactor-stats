@@ -7,6 +7,7 @@ import random
 import time
 import re
 import threading
+import pwd
 from collections import deque, defaultdict, Counter
 from pathlib import Path
 
@@ -16,7 +17,7 @@ FILES_PATH = "input.json"
 RESULT_PATH = "result.json"
 
 WATCHER_RE = re.compile(r"verbose: cf-reactor event watcher has (\d+) watcher\(s\)")
-OBSERVED_RE = re.compile(r"verbose: Observed (.+?) of file '([^']+)'")
+OBSERVED_RE = re.compile(r"verbose: Observed (.+?) of (?:file|user|package) '([^']+)'")
 # report of the then bundle of policy.cf, at the start of the line (not the verbose
 # log of the reports promise)
 HANDLED_RE = re.compile(r"R: handled '([^']+)'")
@@ -76,6 +77,27 @@ def shrink_size(path):
     os.truncate(path, 0)
 
 
+def add_user(name):
+    subprocess.run(["useradd", "--no-create-home", "--no-user-group", "--shell",
+                    "/usr/sbin/nologin", name], check=True)
+
+
+def remove_user(name):
+    subprocess.run(["userdel", name], check=True)
+
+
+DEB_DIR = os.path.join(DIR, "debs")
+
+
+def install_package(name):
+    subprocess.run(["dpkg", "--install", os.path.join(DEB_DIR, f"{name}.deb")],
+                   stdout=subprocess.DEVNULL, check=True)
+
+
+def purge_package(name):
+    subprocess.run(["dpkg", "--purge", name], stdout=subprocess.DEVNULL, check=True)
+
+
 # event type -> (fire, reset). fire makes the change cf-reactor should detect.
 # Some changes can't be repeated (a file can't be deleted twice), so every other
 # turn of such a file runs reset instead, which undoes the change and is not an
@@ -88,7 +110,74 @@ EVENTS = {
     "permissions_changed": (change_permissions, None),
     "owner_changed": (change_owner, None),
     "size_exceeds": (exceed_size, shrink_size),
+    "user_added": (add_user, remove_user),
+    "user_removed": (remove_user, add_user),
+    "package_installed": (install_package, purge_package),
+    "package_uninstalled": (purge_package, install_package),
 }
+
+
+def event_name(event):
+    return event if event.startswith(("user_", "package_")) else f"file_{event}"
+
+
+def target_name(event, i):
+    if event.startswith("user_"):
+        return f"cfrs-user-{i}"
+    if event.startswith("package_"):
+        return f"cfrs-pkg-{i}"
+    return os.path.join(DIR, f"file-{i}.json")
+
+
+def user_exists(name):
+    try:
+        pwd.getpwnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def package_installed(name):
+    proc = subprocess.run(["dpkg-query", "--show", "--showformat", "${db:Status-Abbrev}", name],
+                          capture_output=True, text=True)
+    return proc.stdout.startswith("ii")
+
+
+def setup_user(name, event):
+    """Put the user in the start state of the event."""
+    if user_exists(name) != (event == "user_removed"):
+        (add_user if event == "user_removed" else remove_user)(name)
+
+
+def setup_package(name, event):
+    """Build the dummy package and put it in the start state of the event."""
+    deb = os.path.join(DEB_DIR, f"{name}.deb")
+    if not os.path.exists(deb):
+        root = os.path.join(DEB_DIR, name)
+        os.makedirs(os.path.join(root, "DEBIAN"), exist_ok=True)
+        os.chmod(root, 0o755)  # the ./ of the package, i.e. /
+        with open(os.path.join(root, "DEBIAN", "control"), "w") as f:
+            f.write(f"Package: {name}\nVersion: 1.0\nArchitecture: all\n"
+                    "Maintainer: cf-reactor-stats <root@localhost>\n"
+                    "Description: dummy package to test the package events of cf-reactor\n")
+        subprocess.run(["dpkg-deb", "--root-owner-group", "--build", root, deb],
+                       stdout=subprocess.DEVNULL, check=True)
+    if package_installed(name) != (event == "package_uninstalled"):
+        (install_package if event == "package_uninstalled" else purge_package)(name)
+
+
+def cleanup(event):
+    """Remove the test users or packages, so they are not left on the system."""
+    if event.startswith("user_"):
+        for p in pwd.getpwall():
+            if p.pw_name.startswith("cfrs-user-"):
+                remove_user(p.pw_name)
+    elif event.startswith("package_"):
+        proc = subprocess.run(["dpkg-query", "--show", "--showformat", "${Package}\n",
+                               "cfrs-pkg-*"], capture_output=True, text=True)
+        names = proc.stdout.split()
+        if names:
+            subprocess.run(["dpkg", "--purge", *names], stdout=subprocess.DEVNULL, check=True)
 
 
 def setup_file(path, event):
@@ -301,7 +390,7 @@ def print_stats(args, files, events, detections, handled, storm_start_t, storm_e
  
     print()
     print("==================== Statistics ====================")
-    print(f"Event type:          file_{args.event}")
+    print(f"Event type:          {event_name(args.event)}")
     print(f"Watchers:            {len(files)}")
     print(f"Per-file interval:   {args.interval}s (+ up to {JITTER:.0%} jitter)")
     print(f"Storm duration:      {storm_s:.1f}s")
@@ -373,23 +462,32 @@ def print_stats(args, files, events, detections, handled, storm_start_t, storm_e
 def main():
 
     args = parse_args()
+    if args.event.startswith(("user_", "package_")) and os.geteuid() != 0:
+        print(f"{args.event} needs root to change the users and packages")
+        return
     if args.event == "owner_changed" and os.geteuid() != 0:
         print("file_owner_changed needs root to change the owner of the files")
         return
     fire, reset = EVENTS[args.event]
 
     os.makedirs(DIR, exist_ok=True)
-    files = [os.path.join(DIR, f"file-{i}.json") for i in range(args.num_watchers)]
+    files = [target_name(args.event, i) for i in range(args.num_watchers)]
 
     with open(FILES_PATH, "w") as f:
         json.dump({
-            "event": f"file_{args.event}",
+            "event": event_name(args.event),
             "size_threshold": SIZE_THRESHOLD,
             "files": files,
         }, f)
 
     for file in files:
-        setup_file(file, args.event)
+        if args.event.startswith("user_"):
+            setup_user(file, args.event)
+        elif args.event.startswith("package_"):
+            os.makedirs(DEB_DIR, exist_ok=True)
+            setup_package(file, args.event)
+        else:
+            setup_file(file, args.event)
 
     # run in the background
     proc = subprocess.Popen(
@@ -488,6 +586,7 @@ def main():
     proc.terminate()
     proc.wait()
     reader_thread.join(timeout=5)  # read the end of the output
+    cleanup(args.event)
 
     print_stats(args, files, events, detections, handled, storm_start_t, storm_end, storm_s,
                 wait_end, cpu_s, mem, total_s)
